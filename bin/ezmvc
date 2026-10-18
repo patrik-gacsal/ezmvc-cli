@@ -1,0 +1,2272 @@
+#!/usr/bin/env php
+<?php
+if(php_sapi_name() !== 'cli'){
+    http_response_code(403);
+    exit(1);
+}
+
+define('CLI_COLOR', function_exists('posix_isatty') && posix_isatty(STDOUT));
+
+// Marker file dropped on the target while a deploy is in flight, so an
+// interrupted run is detectable on the next one. Defined up here because the
+// command dispatch below runs before any code further down the file.
+define('DEPLOY_MAINTENANCE_FLAG', '_ezmvc_maintenance');
+
+// How long the deploy endpoint in the maintenance stub stays willing to accept
+// commands. Long enough to upload a large archive over a slow link, short
+// enough that a crashed deploy leaves an inert 503 page well before anyone
+// could make use of it.
+define('DEPLOY_TOKEN_TTL', 1800);
+
+// Commands that work outside a project (no root detection needed)
+$noProjectCommands = ['help', 'setup'];
+
+$args    = array_slice($argv, 1);
+$command = $args[0] ?? 'help';
+
+$projectRoot   = findProjectRoot();
+$frameworkRoot = resolveFrameworkRoot($projectRoot);
+
+// For commands that require a project, fail early with a clear message
+if(!in_array($command, $noProjectCommands) && $projectRoot === null){
+    out('Not inside an ezmvc project.', 'red');
+    out('Run  ezmvc setup  in an empty directory to create one.', 'yellow');
+    out('Or navigate to an existing project root first.', 'none');
+    exit(1);
+}
+
+define('PROJECT_ROOT',   $projectRoot ?? getcwd());
+define('FRAMEWORK_ROOT', $frameworkRoot ?? '');
+
+// 'new' is a compound command: ezmvc new <subcommand> <Name> [extra]
+// (for 'view', the order is instead: ezmvc new view <type> <Name>)
+if($command === 'new'){
+    cmdNew($args[1] ?? null, $args[2] ?? null, $args[3] ?? null);
+    exit(0);
+}
+
+if($command === 'deploy'){
+    cmdDeploy(array_slice($args, 1));
+    exit(0);
+}
+
+if($command === 'scaffold'){
+    cmdScaffold(array_slice($args, 1));
+    exit(0);
+}
+
+if($command === 'verify'){
+    cmdVerify($args[1] ?? null, array_slice($args, 2));
+    exit(0);
+}
+
+if($command === 'swagger:mirror'){
+    cmdSwaggerMirror(array_slice($args, 1));
+    exit(0);
+}
+
+$name = $args[1] ?? null;
+
+$commands = [
+    'generate' => 'cmdGenerate',
+    'setup'    => 'cmdSetup',
+    'help'     => 'cmdHelp',
+];
+
+if(isset($commands[$command])){
+    $commands[$command] === 'cmdGenerate'
+        ? cmdGenerate(array_slice($args, 1))
+        : $commands[$command]($name);
+}else{
+    fail('Unknown command: ' . $command);
+    cmdHelp(null);
+    exit(1);
+}
+
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+function cmdNew(?string $subcommand, ?string $arg2, ?string $arg3 = null): void{
+    $subcommands = [
+        'controller'      => 'cmdMakeApi',
+        'page-controller' => 'cmdMakeController',
+        'view'            => 'cmdMakeView',
+        'service'         => 'cmdMakeService',
+        'exception'       => 'cmdMakeException',
+        'request'         => 'cmdMakeApiRequest',
+        'form-request'    => 'cmdMakeRequest',
+        'response'        => 'cmdMakeResponse',
+    ];
+    if(!$subcommand || !isset($subcommands[$subcommand])){
+        fail('Usage: ezmvc new <subcommand> <Name>');
+        out('', 'none');
+        out('Subcommands:', 'bold');
+        out('  controller       <Name>          New ApiController with CRUD route stubs');
+        out('  page-controller  <Name>          New page Controller');
+        out('  view             <type> <Name>   New View — type: single|multi|leaf|page');
+        out('  service          <Name>          New plain Service class (no base class)');
+        out('  exception        <Name>          New ApiException subclass (HTTP status baked in)');
+        out('  request          <Name>          New API request contract (Validators\\* field validation)');
+        out('  form-request     <Name>          New form/multipart Request class (page Controllers)');
+        out('  response         <Name>          New API Response class');
+        out('', 'none');
+        out('Use  ezmvc scaffold  to generate Entity/Dto from an existing DB table.', 'yellow');
+        exit(1);
+    }
+    if($subcommand === 'view'){
+        // ezmvc new view <type> <Name>
+        cmdMakeView($arg2, $arg3);
+        return;
+    }
+    $subcommands[$subcommand]($arg2);
+}
+
+function cmdGenerate(array $args = []): void{
+    requireFramework();
+    ensureDir(PROJECT_ROOT . '/generated');
+
+    // Routes
+    out('Building routes...', 'cyan');
+    $routes = \EzMvc\Router::build(PROJECT_ROOT . '/controllers/');
+    $total  = 0;
+    foreach($routes as $verb => $list){
+        foreach($list as $r){
+            out('  ' . pad($verb, 7) . $r['path'] . '  →  ' . $r['controller'] . '::' . $r['method'] . '()', 'none');
+            $total++;
+        }
+    }
+    // A literal path overlapping a parameterised one is resolved by build()'s
+    // ordering. Two identical patterns on the same verb are not resolvable —
+    // the second can never be reached, so say so.
+    foreach(\EzMvc\Router::findDuplicates($routes) as $verb => $pairs){
+        foreach($pairs as [$winner, $unreachable]){
+            out('  ! ' . pad($verb, 7) . $unreachable['path'] . '  →  '
+                . $unreachable['controller'] . '::' . $unreachable['method'] . '() is unreachable, '
+                . $winner['controller'] . '::' . $winner['method'] . '() already matches it', 'yellow');
+        }
+    }
+    \EzMvc\Router::save($routes, PROJECT_ROOT . '/generated/routes.php');
+    ok($total . ' route(s) written to generated/routes.php');
+
+    // Swagger — when the project has turned it off (Config::ENABLE_SWAGGER=false)
+    // we deliberately write an EMPTY spec rather than skip writing. generated/swagger.json
+    // is a whitelisted public path in .htaccess, so a stale full spec would keep leaking
+    // the whole API surface even with the docs UI gated off on the frontend. Overwriting
+    // it with {} removes that exposure on the next generate.
+    if(!swaggerEnabled()){
+        file_put_contents(PROJECT_ROOT . '/generated/swagger.json', '{}');
+        ok('Swagger disabled (Config::ENABLE_SWAGGER=false) — wrote empty generated/swagger.json');
+    }else{
+        $generatorFile = FRAMEWORK_ROOT . '/core/swaggergen/Generator.php';
+        if(!file_exists($generatorFile)){
+            out('Swagger generator not found (is the framework installed?), skipping.', 'yellow');
+        }else{
+            $verbose = in_array('--verbose', $args ?? []);
+            out('Building swagger spec...', 'cyan');
+            require_once FRAMEWORK_ROOT . '/core/swaggergen/OpenApi3.php';
+            require_once $generatorFile;
+            try{
+                $json = swaggergen\Generator::build(PROJECT_ROOT, $verbose);
+                $decoded = json_decode($json, true);
+                $pathCount = count($decoded['paths'] ?? []);
+                file_put_contents(PROJECT_ROOT . '/generated/swagger.json', $json);
+                ok('Swagger spec written to generated/swagger.json (' . $pathCount . ' path(s))');
+            }catch(Throwable $e){
+                fail('Swagger generation failed: ' . $e->getMessage());
+            }
+        }
+    }
+
+
+    buildStyles();
+    refreshComposerAutoloader();
+}
+
+/**
+ * Concatenates every co-located view stylesheet into generated/app.css.
+ * Sources are templates/**.css from each installed addon first and the
+ * project's own templates/ last, so a project rule wins over an addon's at
+ * equal specificity. Rules are copied verbatim and only comments are dropped
+ * (see stripCssComments), which is why each file has to confine itself by
+ * nesting its rules inside the view's own class — the wrapper that
+ * `ezmvc new view` generates.
+ *
+ * It lands in generated/ rather than public/ because it is a build artifact,
+ * not a hand-placed asset; .htaccess whitelists it by exact name, the same way
+ * it does generated/swagger.json.
+ */
+function buildStyles(): void{
+    $roots = glob(PROJECT_ROOT . '/vendor/ezmvc/*/templates', GLOB_ONLYDIR) ?: [];
+    $roots[] = PROJECT_ROOT . '/templates';
+
+    $sheets = [];
+    foreach($roots as $root){
+        array_push($sheets, ...findStyleSheets($root));
+    }
+    if(!$sheets){
+        return;
+    }
+
+    out('Building stylesheet...', 'cyan');
+    $parts = [];
+    foreach($sheets as $file){
+        $rules = stripCssComments(file_get_contents($file));
+        if($rules !== ''){
+            $parts[] = $rules;
+        }
+    }
+    // A literal newline, not PHP_EOL: the built file must be byte-identical
+    // whatever platform ran the build.
+    $css = implode("\n\n", $parts) . "\n";
+    file_put_contents(PROJECT_ROOT . '/generated/app.css', $css);
+    ok(count($sheets) . ' stylesheet(s) written to generated/app.css (' . strlen($css) . ' bytes)');
+}
+
+/**
+ * Strips CSS comments, so nothing the browser receives describes the project's
+ * directory layout, the widget conventions, or the framework that built it —
+ * the same reasoning as the uniform 404 and the generic session cookie name.
+ * A comment whose opener ends in an exclamation mark survives, the usual
+ * convention for a licence header an addon is obliged to keep.
+ *
+ * A regex, not a CSS parser: an opener sitting inside a quoted string or an
+ * unquoted url() would be taken for a real one. Widget CSS realistically
+ * contains neither, and the alternative is tokenising CSS in the CLI.
+ */
+function stripCssComments(string $css): string{
+    $css = preg_replace('~/\*(?!!).*?\*/~s', '', $css);
+    // Whatever the removed comments left dangling at a line end.
+    return trim(preg_replace('~[ 	]+$~m', '', $css));
+}
+
+/**
+ * Every .css under $dir, sorted by path so a rebuild is byte-identical across
+ * runs and machines (directory iteration order is not).
+ * @return string[]
+ */
+function findStyleSheets(string $dir): array{
+    if(!is_dir($dir)){
+        return [];
+    }
+    $files = [];
+    $tree  = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+    foreach($tree as $file){
+        if($file->isFile() && strtolower($file->getExtension()) === 'css'){
+            $files[] = $file->getPathname();
+        }
+    }
+    sort($files);
+    return $files;
+}
+
+/**
+ * Whether the project wants a real swagger spec generated.
+ * Reads Config::ENABLE_SWAGGER from the project's Config(.local).php.
+ * Defaults to true when Config, the class, or the constant is absent — so
+ * projects that predate the ENABLE_SWAGGER constant keep generating as before.
+ */
+function swaggerEnabled(): bool{
+    $configFile = PROJECT_ROOT . '/' . (file_exists(PROJECT_ROOT . '/Config.local.php') ? 'Config.local.php' : 'Config.php');
+    if(file_exists($configFile)){
+        require_once $configFile;
+    }
+    if(defined('Config::ENABLE_SWAGGER')){
+        return (bool) constant('Config::ENABLE_SWAGGER');
+    }
+    return true;
+}
+
+/**
+ * Runs `composer dump-autoload` if the project has opted in with an
+ * autoload section in its composer.json (created by `ezmvc setup`, or added
+ * by hand). No-op otherwise — a project without one just keeps using manual
+ * require_once, exactly as before.
+ */
+function refreshComposerAutoloader(): void{
+    $composerJson = PROJECT_ROOT . '/composer.json';
+    if(!file_exists($composerJson)){
+        return;
+    }
+    $config = json_decode(file_get_contents($composerJson), true);
+    if(!is_array($config) || empty($config['autoload'])){
+        return;
+    }
+    out('Refreshing Composer autoloader...', 'cyan');
+    exec('composer dump-autoload --working-dir=' . escapeshellarg(PROJECT_ROOT) . ' 2>&1', $output, $exitCode);
+    if($exitCode === 0){
+        ok('Composer autoloader refreshed.');
+    }else{
+        out('  Warning: composer dump-autoload failed — is Composer installed and on PATH?', 'yellow');
+        foreach($output as $line){
+            out('  ' . $line, 'none');
+        }
+    }
+}
+
+function cmdMakeApi(?string $name): void{
+    requireName($name, 'new controller');
+    $name      = slugToName($name);
+    $className = $name . 'Controller';
+    $slug      = nameToSlug($name);
+    $file      = PROJECT_ROOT . '/controllers/' . $className . '.php';
+    guardExists($file);
+    $tpl = <<<PHP
+<?php
+
+use EzMvc\ApiController;
+use EzMvc\ApiException;
+use EzMvc\Response;
+use EzMvc\Attr\{Get, Post, Put, Delete, Patch};
+
+// Actions return a Response (or a bare DTO → 200); throw ApiException::notFound()
+// etc. for errors — the dispatcher renders either. No die(), so actions are testable.
+class {$className} extends ApiController {
+
+    public function init(): void {
+
+    }
+
+    #[Get('/{$slug}')]
+    public function getAll(): Response {
+        return Response::ok([]);
+    }
+
+    #[Get('/{$slug}/{id}')]
+    public function getOne(): Response {
+        \$id = \$this->routeParam('id');
+        // throw ApiException::notFound('...') when the row doesn't exist
+        return Response::ok(null);
+    }
+
+    #[Post('/{$slug}')]
+    public function create(): Response {
+        return Response::created(null);
+    }
+
+    #[Put('/{$slug}/{id}')]
+    public function update(): Response {
+        \$id = \$this->routeParam('id');
+        return Response::ok(null);
+    }
+
+    #[Delete('/{$slug}/{id}')]
+    public function remove(): Response {
+        \$id = \$this->routeParam('id');
+        return Response::noContent();
+    }
+
+}
+PHP;
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+    out("Run 'ezmvc generate' to register routes and update swagger.", 'yellow');
+}
+
+function cmdMakeController(?string $name): void{
+    requireName($name, 'new page-controller');
+    $name      = slugToName($name);
+    $className = $name . 'Controller';
+    $slug      = nameToSlug($name);
+    $file      = PROJECT_ROOT . '/controllers/' . $className . '.php';
+    guardExists($file);
+    $tpl = <<<PHP
+<?php
+
+use EzMvc\PageController;
+use EzMvc\Attr\Web;
+use EzMvc\View;
+
+class {$className} extends PageController {
+
+    public function init(): void {
+        \$this->setTitle('{$name}');
+    }
+
+    #[Web('/{$slug}')]
+    public function index(): View {
+        return new {$name}View();
+    }
+
+}
+PHP;
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+    out("Run 'ezmvc generate' to register routes.", 'yellow');
+}
+
+function cmdScaffold(array $args): void{
+    $scaffold = FRAMEWORK_ROOT . '/core/orm/OrmScaffolder.php';
+    if(!file_exists($scaffold)){
+        fail('core/orm/OrmScaffolder.php not found (is the framework installed?).');
+        exit(1);
+    }
+    require_once $scaffold;
+
+    $flags     = parseFlags($args);
+    $overwrite = isset($flags['overwrite']);
+    $tables    = isset($flags['table'])
+        ? array_filter(array_map('trim', explode(',', $flags['table'])))
+        : null;
+
+    $conn = resolveScaffoldConnection($flags);
+
+    $results = \EzMvc\OrmScaffolder::createOrm(
+        $conn,
+        PROJECT_ROOT . '/entities/',
+        PROJECT_ROOT . '/dtos/',
+        $overwrite,
+        $tables
+    );
+
+    if(!$results){
+        fail('No tables found.');
+        exit(1);
+    }
+
+    foreach($results as $table => $status){
+        if($status === 'created'){
+            ok('Scaffolded ' . $table . ' — Entity, Dto (toDto()/fromDto())');
+        }elseif($status === 'skipped'){
+            out('  Skipped ' . $table . ' (already exists, use --overwrite to replace)', 'yellow');
+        }else{
+            fail($table . ': ' . $status);
+        }
+    }
+
+    if(isset($flags['no-db-class'])){
+        return;
+    }
+
+    $db = \EzMvc\OrmScaffolder::createDbClass(
+        $conn,
+        PROJECT_ROOT . '/databases/',
+        $flags['db-class'] ?? null,
+        $overwrite,
+        $tables
+    );
+
+    if($db['status'] === 'created'){
+        ok('Generated ' . $db['class'] . ' — one accessor per table, holding a Database as $db');
+    }elseif($db['status'] === 'skipped'){
+        out('  Skipped ' . $db['class'] . ' (already exists; --overwrite replaces it and discards hand-written methods)', 'yellow');
+    }else{
+        fail($db['class'] . ': ' . $db['status']);
+    }
+}
+
+/**
+ * Fetch the Swagger UI assets into the framework's swagger/ directory so a
+ * deployment can serve them itself instead of relying on the CDN at runtime.
+ * They're never committed (gitignored) — this is the acquire step: run it once
+ * per checkout, and again whenever swagger/swagger-ui.version is bumped.
+ * Version comes from swagger/swagger-ui.version, or --version=X.Y.Z to override.
+ */
+function cmdSwaggerMirror(array $args): void{
+    $swaggerDir = FRAMEWORK_ROOT . '/swagger';
+    if(!is_dir($swaggerDir)){
+        fail('swagger/ not found (is the framework installed?).');
+        exit(1);
+    }
+    if(!function_exists('curl_init')){
+        fail('The curl extension is required to fetch the Swagger UI assets.');
+        exit(1);
+    }
+
+    $flags    = parseFlags($args);
+    $versFile = $swaggerDir . '/swagger-ui.version';
+    $version  = $flags['version']
+        ?? (file_exists($versFile) ? trim(file_get_contents($versFile)) : null);
+    if(!$version){
+        fail('No Swagger UI version — expected swagger/swagger-ui.version, or pass --version=X.Y.Z');
+        exit(1);
+    }
+
+    // Only the assets swagger/index.html.php actually references.
+    $assets = [
+        'swagger-ui.css',
+        'swagger-ui-bundle.js',
+        'swagger-ui-standalone-preset.js',
+        'favicon-32x32.png',
+        'favicon-16x16.png',
+    ];
+    $base   = 'https://cdn.jsdelivr.net/npm/swagger-ui-dist@' . rawurlencode($version) . '/';
+
+    out('Mirroring Swagger UI ' . $version . ' from jsDelivr...', 'cyan');
+    $failed = 0;
+    foreach($assets as $asset){
+        if(swaggerFetch($base . $asset, $swaggerDir . '/' . $asset)){
+            ok($asset);
+        }else{
+            fail($asset . ' — download failed (' . $base . $asset . ')');
+            $failed++;
+        }
+    }
+
+    out('');
+    if($failed === 0){
+        // The CDN fallback in index.html.php loads a file only when it matches
+        // these hashes, so a compromised CDN can't run script on the app's origin.
+        $integrity = ['version' => $version];
+        foreach(['swagger-ui.css', 'swagger-ui-bundle.js', 'swagger-ui-standalone-preset.js'] as $asset){
+            $integrity[$asset] = 'sha384-' . base64_encode(hash_file('sha384', $swaggerDir . '/' . $asset, true));
+        }
+        file_put_contents($swaggerDir . '/swagger-ui.integrity.json', json_encode($integrity, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+
+        ok('Swagger UI mirrored into swagger/ — the docs page now serves these local copies.');
+        ok('swagger/swagger-ui.integrity.json written — commit it with swagger-ui.version.');
+        out('The assets are gitignored; re-run after bumping swagger/swagger-ui.version.', 'yellow');
+    }else{
+        fail($failed . ' asset(s) failed. The docs page falls back to the CDN until they are present.');
+        exit(1);
+    }
+}
+
+/**
+ * Download a URL to a local file, following redirects. Returns false (and
+ * removes any partial file) on a transport error or a non-2xx response.
+ */
+function swaggerFetch(string $url, string $dest): bool{
+    $fp = @fopen($dest, 'wb');
+    if(!$fp){
+        return false;
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_FILE           => $fp,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_FAILONERROR    => true,
+    ]);
+    $result = curl_exec($ch);
+    $code   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    // no curl_close(): since PHP 8 $ch is a CurlHandle freed by GC on return
+    fclose($fp);
+    if($result === false || $code < 200 || $code > 299){
+        @unlink($dest);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Smoke-test a scaffolded Entity+Dto pair against the real database: builds a
+ * dummy Dto, then exercises fromDto()/store()/getById()/find()/update()/toDto()
+ * and deleteLogical() (if present), cleaning up the test row afterward.
+ * Only supports the generated Entity+Dto convention — hand-written Entities
+ * without a matching {Name}Dto class aren't covered.
+ */
+function cmdVerify(?string $name, array $args): void{
+    requireName($name, 'verify');
+
+    $entityFile = PROJECT_ROOT . '/entities/' . $name . '.php';
+    $dtoFile    = PROJECT_ROOT . '/dtos/'     . $name . 'Dto.php';
+    if(!file_exists($entityFile)){
+        fail('entities/' . $name . '.php not found. Run `ezmvc scaffold` first.');
+        exit(1);
+    }
+    if(!file_exists($dtoFile)){
+        fail('dtos/' . $name . 'Dto.php not found. `ezmvc verify` only supports scaffolded Entity+Dto pairs.');
+        exit(1);
+    }
+
+    $conn = resolveScaffoldConnection(parseFlags($args));
+
+    foreach(['core/attributes/Entity.php', 'core/orm/EntityMeta.php', 'core/orm/SearchCriteria.php', 'core/orm/Entity.php'] as $rel){
+        require_once FRAMEWORK_ROOT . '/' . $rel;
+    }
+    require_once $dtoFile;
+    require_once $entityFile;
+
+    \EzMvc\Entity::bindDefaultConnection($conn);
+
+    $entityClass = $name;
+    $dtoClass    = $name . 'Dto';
+
+    $idProperty = verifyFindIdProperty($entityClass);
+    if(!$idProperty){
+        fail('Could not determine the id property on ' . $entityClass);
+        exit(1);
+    }
+
+    $passed = 0;
+    $failed = 0;
+    $step   = function(string $label, callable $fn) use (&$passed, &$failed){
+        try{
+            $fn();
+            ok($label);
+            $passed++;
+        }catch(\Throwable $e){
+            fail($label . ' — ' . $e->getMessage());
+            $failed++;
+        }
+    };
+
+    $dto = new $dtoClass();
+    foreach((new \ReflectionClass($dtoClass))->getProperties(\ReflectionProperty::IS_PUBLIC) as $prop){
+        $type = $prop->getType();
+        $tn   = $type instanceof \ReflectionNamedType ? $type->getName() : 'string';
+        $prop->setValue($dto, verifyDummyValue($tn));
+    }
+
+    $entity = null;
+    $id     = null;
+
+    $step('fromDto() builds an entity', function() use ($entityClass, $dto, &$entity){
+        $entity = $entityClass::fromDto($dto);
+        if(!($entity instanceof $entityClass)){
+            throw new \Exception('fromDto() did not return a ' . $entityClass);
+        }
+    });
+
+    if($entity){
+        $step('store()', function() use ($entity, $idProperty, &$id){
+            $entity->store();
+            $id = $entity->$idProperty;
+            if($id === null){
+                throw new \Exception('id was not populated after store()');
+            }
+        });
+    }
+
+    $fetched = null;
+    if($id !== null){
+        $step('getById() fetches the stored row', function() use ($entityClass, $id, &$fetched){
+            $fetched = $entityClass::getById($id);
+            if(!$fetched){
+                throw new \Exception('getById(' . $id . ') returned null');
+            }
+        });
+    }
+
+    if($fetched){
+        $step('find() includes the stored row', function() use ($fetched, $idProperty){
+            $all = (new (get_class($fetched))())->find();
+            foreach($all as $row){
+                if($row->$idProperty == $fetched->$idProperty){
+                    return;
+                }
+            }
+            throw new \Exception('find() did not return the stored row');
+        });
+
+        $writableProp = verifyFindWritableProperty($entityClass, $idProperty);
+        if($writableProp){
+            $step('update() persists a change', function() use ($fetched, $entityClass, $id, $writableProp){
+                $newValue = verifyDummyValue(verifyPropertyType($entityClass, $writableProp), true);
+                $fetched->$writableProp = $newValue;
+                $fetched->update();
+                $refetched = $entityClass::getById($id);
+                if($refetched->$writableProp != $newValue){
+                    throw new \Exception('updated value did not persist');
+                }
+            });
+        }
+
+        $step('toDto() returns the matching Dto', function() use ($fetched, $dtoClass){
+            $resultDto = $fetched->toDto();
+            if(!($resultDto instanceof $dtoClass)){
+                throw new \Exception('toDto() did not return a ' . $dtoClass);
+            }
+        });
+
+        if(method_exists($fetched, 'deleteLogical')){
+            $step('deleteLogical() soft-deletes', function() use ($fetched, $entityClass, $id){
+                $fetched->deleteLogical();
+                $refetched      = $entityClass::getById($id);
+                $deleteDateProp = verifyFindDeleteDateProperty($entityClass);
+                if(!$deleteDateProp || !$refetched->$deleteDateProp){
+                    throw new \Exception('delete_date was not set after deleteLogical()');
+                }
+            });
+        }
+    }
+
+    // Best-effort cleanup regardless of what failed above.
+    if($id !== null){
+        try{
+            $cleanup = $entityClass::getById($id);
+            if($cleanup){
+                $cleanup->delete();
+            }
+        }catch(\Throwable $e){
+            out('  Warning: could not clean up test row ' . $id . ' — ' . $e->getMessage(), 'yellow');
+        }
+    }
+
+    out('');
+    if($failed === 0){
+        ok($passed . ' check(s) passed.');
+    }else{
+        fail($failed . ' check(s) failed, ' . $passed . ' passed.');
+        exit(1);
+    }
+}
+
+function verifyFindIdProperty(string $class): ?string{
+    $ref = new \ReflectionClass($class);
+    foreach($ref->getProperties(\ReflectionProperty::IS_PUBLIC) as $prop){
+        if($prop->getAttributes(\EzMvc\Attr\Id::class)){
+            return $prop->getName();
+        }
+    }
+    return $ref->hasProperty('id') ? 'id' : null;
+}
+
+function verifyFindDeleteDateProperty(string $class): ?string{
+    $ref = new \ReflectionClass($class);
+    foreach($ref->getProperties(\ReflectionProperty::IS_PUBLIC) as $prop){
+        foreach($prop->getAttributes(\EzMvc\Attr\Column::class) as $attr){
+            if($attr->newInstance()->name === 'delete_date'){
+                return $prop->getName();
+            }
+        }
+        if(in_array($prop->getName(), ['deleteDate', 'delete_date'], true)){
+            return $prop->getName();
+        }
+    }
+    return null;
+}
+
+/**
+ * Picks a property to safely mutate for the update() check. Excludes the id
+ * and anything named/attributed as read-only. Name-based exclusion of
+ * create_date/delete_date covers entities that mark them read-only via
+ * setReadOnlyFields() in init() rather than the #[ReadOnlyField] attribute
+ * (which the scaffolder currently does).
+ */
+function verifyFindWritableProperty(string $class, string $idProperty): ?string{
+    $excluded = [$idProperty, 'createDate', 'create_date', 'deleteDate', 'delete_date'];
+    $ref      = new \ReflectionClass($class);
+    foreach($ref->getProperties(\ReflectionProperty::IS_PUBLIC) as $prop){
+        $n = $prop->getName();
+        if(in_array($n, $excluded, true) || $n[0] === '_'){
+            continue;
+        }
+        if($prop->getAttributes(\EzMvc\Attr\ReadOnlyField::class)){
+            continue;
+        }
+        $type = $prop->getType();
+        $tn   = $type instanceof \ReflectionNamedType ? $type->getName() : null;
+        if($tn && in_array($tn, ['int', 'float', 'bool', 'string'], true)){
+            return $n;
+        }
+    }
+    return null;
+}
+
+function verifyPropertyType(string $class, string $property): string{
+    $type = (new \ReflectionClass($class))->getProperty($property)->getType();
+    return $type instanceof \ReflectionNamedType ? $type->getName() : 'string';
+}
+
+function verifyDummyValue(string $type, bool $alt = false): mixed{
+    return match($type){
+        'int'   => $alt ? 2 : 1,
+        'float' => $alt ? 2.2 : 1.1,
+        'bool'  => $alt ? false : true,
+        default => $alt ? 'ezmvc-verify-updated' : 'ezmvc-verify',
+    };
+}
+
+/**
+ * Resolve a mysqli connection for scaffolding.
+ * If --host/--db/--user/--pass are given, connect with those (multi-db setups).
+ * Otherwise fall back to the project's own Config.php + StaticDatabase, so a
+ * single-DB project needs no connection flags at all.
+ */
+function resolveScaffoldConnection(array $flags): \mysqli{
+    $custom = array_intersect_key($flags, array_flip(['host', 'db', 'user', 'pass']));
+    if($custom){
+        foreach(['host', 'db', 'user', 'pass'] as $req){
+            if(!isset($flags[$req])){
+                fail('--host, --db, --user and --pass must all be given together for a custom connection.');
+                exit(1);
+            }
+        }
+        out('Connecting to ' . $flags['host'] . '/' . $flags['db'] . '...', 'cyan');
+        try{
+            return new \mysqli($flags['host'], $flags['user'], $flags['pass'], $flags['db']);
+        }catch(\mysqli_sql_exception $e){
+            fail('Connection failed: ' . $e->getMessage());
+            exit(1);
+        }
+    }
+
+    $configFile = PROJECT_ROOT . '/' . (file_exists(PROJECT_ROOT . '/Config.local.php') ? 'Config.local.php' : 'Config.php');
+    $database   = FRAMEWORK_ROOT . '/core/orm/Database.php';
+    $staticDb   = FRAMEWORK_ROOT . '/core/orm/StaticDatabase.php';
+    if(!file_exists($configFile)){
+        fail('Config.php not found. Pass --host --db --user --pass, or run inside a configured project.');
+        exit(1);
+    }
+    if(!file_exists($staticDb) || !file_exists($database)){
+        fail('core/orm/StaticDatabase.php not found (is the framework installed?).');
+        exit(1);
+    }
+
+    out('No connection flags given, using this project\'s Config.php...', 'cyan');
+    require_once $configFile;
+    require_once $database;   // StaticDatabase delegates to Database — load it first
+    require_once $staticDb;
+    try{
+        \EzMvc\StaticDatabase::init(Config::DB_HOST, Config::DB_USER, Config::DB_PASS, Config::DB_NAME);
+    }catch(\mysqli_sql_exception $e){
+        fail('Connection failed: ' . $e->getMessage());
+        exit(1);
+    }
+    return \EzMvc\StaticDatabase::getConnection();
+}
+
+/**
+ * Parse "--flag" and "--key=value" style CLI arguments into an assoc array.
+ */
+function parseFlags(array $args): array{
+    $flags = [];
+    foreach($args as $arg){
+        if(strpos($arg, '--') !== 0) continue;
+        $arg = substr($arg, 2);
+        if(str_contains($arg, '=')){
+            [$key, $value] = explode('=', $arg, 2);
+            $flags[$key]   = $value;
+        }else{
+            $flags[$arg] = true;
+        }
+    }
+    return $flags;
+}
+
+function cmdMakeView(?string $type, ?string $name): void{
+    $validTypes = ['single', 'multi', 'leaf', 'page'];
+    if(!$type || !in_array($type, $validTypes, true)){
+        fail('Usage: ezmvc new view <type> <Name>');
+        out('  type must be one of: single, multi, leaf, page', 'yellow');
+        out('    single  extends SingleChildView — public View|string $child', 'none');
+        out('    multi   extends MultiChildView  — public array $children', 'none');
+        out('    leaf    extends View directly    — no nested content', 'none');
+        out('    page    extends PageView         — wraps a page action\'s output in a full document', 'none');
+        exit(1);
+    }
+    if(!$name){
+        fail('Usage: ezmvc new view <type> <Name>');
+        exit(1);
+    }
+
+    $name      = slugToName($name);
+    $viewClass = $type === 'page' ? $name . 'PageView' : $name . 'View';
+    $slug      = nameToSlug($name);
+    // The wrapper selector every generated rule nests inside — must match what
+    // View::cssClass() emits at runtime, which slugifies the whole class name.
+    $cssClass  = nameToSlug($viewClass);
+    $viewFile  = PROJECT_ROOT . '/views/' . $viewClass . '.php';
+    $tplFile   = PROJECT_ROOT . '/templates/' . $slug . '.php';
+    $cssFile   = PROJECT_ROOT . '/templates/' . $slug . '.css';
+    guardExists($viewFile);
+    guardExists($tplFile);
+    guardExists($cssFile);
+    ensureDir(PROJECT_ROOT . '/views');
+    ensureDir(PROJECT_ROOT . '/templates');
+
+    $viewTpl = match($type){
+        'single' => <<<PHP
+<?php
+
+use EzMvc\SingleChildView;
+use EzMvc\View;
+
+class {$viewClass} extends SingleChildView {
+
+    public function __construct(View|string \$child, ?string \$id = null) {
+        parent::__construct(\$child, \$id);
+        \$this->setTemplate('{$slug}');
+    }
+
+}
+PHP,
+        'multi' => <<<PHP
+<?php
+
+use EzMvc\MultiChildView;
+
+class {$viewClass} extends MultiChildView {
+
+    public function __construct(array \$children = [], ?string \$id = null) {
+        parent::__construct(\$children, \$id);
+        \$this->setTemplate('{$slug}');
+    }
+
+}
+PHP,
+        'leaf' => <<<PHP
+<?php
+
+use EzMvc\View;
+
+class {$viewClass} extends View {
+
+    public function __construct(?string \$id = null) {
+        parent::__construct(\$id);
+        \$this->setTemplate('{$slug}');
+    }
+
+}
+PHP,
+        'page' => <<<PHP
+<?php
+
+use EzMvc\PageView;
+use EzMvc\View;
+
+class {$viewClass} extends PageView {
+
+    public function __construct(
+        View|string \$child,
+        ?string \$title = null,
+        ?string \$lang = null,
+        ?array \$bodyClasses = null,
+        ?string \$id = null,
+    ) {
+        parent::__construct(\$child, \$title, \$lang, \$bodyClasses, \$id);
+        \$this->setTemplate('{$slug}');
+    }
+
+}
+PHP,
+    };
+
+    $annotation = "<?php /* @var \$this {$viewClass} */ /** @var {$viewClass} \$this */ ?>";
+
+    $templateTpl = match($type){
+        'single' => $annotation . "\n"
+            . "<div<?= \$this->idAttr() ?> class=\"<?= \$this->cssClass() ?>\"><?= \$this->renderChild() ?></div>\n",
+        'multi'  => $annotation . "\n"
+            . "<div<?= \$this->idAttr() ?> class=\"<?= \$this->cssClass() ?>\"><?= \$this->renderChildren() ?></div>\n",
+        'leaf'   => $annotation . "\n"
+            . "<div<?= \$this->idAttr() ?> class=\"<?= \$this->cssClass() ?>\"></div>\n",
+        'page'   => <<<PHP
+<?php
+    /* @var \$this {$viewClass} */
+    /** @var {$viewClass} \$this */
+    \$esc = fn(\$v) => htmlspecialchars((string) \$v, ENT_QUOTES, 'UTF-8');
+?>
+<!DOCTYPE html>
+<html lang="<?= \$esc(\$this->lang) ?>">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+        <title><?= \$esc(\$this->title) ?></title>
+        <?= \$this->stylesheetTag() ?>
+    </head>
+    <body class="<?= \$esc(implode(' ', array_merge([\$this->cssClass()], \$this->bodyClasses))) ?>">
+        <?= \$this->renderChild() ?>
+    </body>
+</html>
+
+PHP,
+    };
+
+    $cssTpl = <<<CSS
+/* Nest every rule inside this selector so it cannot collide with another view's. */
+.{$cssClass} {
+
+}
+
+CSS;
+
+    writeFile($viewFile, $viewTpl);
+    writeFile($tplFile, $templateTpl);
+    writeFile($cssFile, $cssTpl);
+    ok('Created ' . $viewFile);
+    ok('Created ' . $tplFile);
+    ok('Created ' . $cssFile);
+}
+
+function cmdMakeService(?string $name): void{
+    requireName($name, 'new service');
+    $name         = slugToName($name);
+    $serviceClass = $name . 'Service';
+    $file         = PROJECT_ROOT . '/services/' . $serviceClass . '.php';
+    guardExists($file);
+    ensureDir(PROJECT_ROOT . '/services');
+
+    $tpl = <<<PHP
+<?php
+
+/**
+ * Plain class, no base class — see CLAUDE.md's "Services (optional)" section.
+ * Return real typed values directly; throw your own exception (not a
+ * framework class) for expected business failures and let the Controller
+ * catch it. No PageController/ApiController/View types in here — a Service
+ * doesn't know or care which one called it.
+ *
+ * public function someOperation(SomeRequest \$request): SomeEntity {
+ *     if (! \$valid) {
+ *         throw new ValidationException(...);
+ *     }
+ *     return SomeEntity::fromDto(\$request);
+ * }
+ */
+class {$serviceClass} {
+
+}
+PHP;
+
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+}
+
+function cmdMakeException(?string $name): void{
+    requireName($name, 'new exception');
+    $name           = slugToName($name);
+    $exceptionClass = $name . 'Exception';
+    $file           = PROJECT_ROOT . '/exceptions/' . $exceptionClass . '.php';
+    guardExists($file);
+    ensureDir(PROJECT_ROOT . '/exceptions');
+
+    $tpl = <<<PHP
+<?php
+
+/**
+ * Project-defined API exception — see CLAUDE.md's "Services (optional)" section.
+ * Throw it from any layer below the controller (service, entity, …); index.php's
+ * ApiController boundary returns its HTTP status and shows the message to the
+ * client. No transport knowledge is needed beyond the status baked in below.
+ *
+ * Change 400 to what this error means (404 not found, 409 conflict, 422
+ * unprocessable, …). For an error a controller catches and presents itself
+ * (e.g. a page re-rendering a form), extend \Exception instead of ApiException.
+ */
+class {$exceptionClass} extends \EzMvc\ApiException {
+
+    public function __construct(string \$message = '') {
+        parent::__construct(400, \$message);
+    }
+
+}
+PHP;
+
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+}
+
+function cmdMakeApiRequest(?string $name): void{
+    requireName($name, 'new request');
+    $name      = slugToName($name);
+    $className = $name . 'Request';
+    $file      = PROJECT_ROOT . '/requests/' . $className . '.php';
+    guardExists($file);
+    ensureDir(PROJECT_ROOT . '/requests');
+    $tpl = <<<PHP
+<?php
+
+/**
+ * An API contract — the request shape this endpoint accepts. Name it after the
+ * operation, not an entity.
+ *
+ * Write one when no single entity's Dto expresses the shape: a payload spanning
+ * several entities, an action-specific body, or a narrower view than the table.
+ * If a {Table}Dto already is the shape you want, use that instead — a Dto is a
+ * perfectly good contract, and a second class buys nothing.
+ *
+ * Every Validators\\* class doubles as a property attribute, so the argument
+ * list is a real constructor call: autocomplete and type-checking come from
+ * the language, not from documentation.
+ */
+class {$className} {
+
+    #[Validators\Line(minLength: 1, maxLength: 120)]
+    public string \$field;
+
+    // #[Validators\Email]
+    // public string \$email;
+
+    // #[Validators\Integer(signed: true)]
+    // public int \$amount;
+
+    // optional: true also lets an empty string through
+    // #[Validators\Text(maxLength: 2000, optional: true)]
+    // public ?string \$notes = null;
+
+}
+PHP;
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+    out("Use with: \$req = \$this->checkRequestAs(new {$className}());", 'none');
+}
+
+function cmdMakeRequest(?string $name): void{
+    requireName($name, 'make:request');
+    $name      = slugToName($name);
+    $className = $name . 'Request';
+    $file      = PROJECT_ROOT . '/requests/' . $className . '.php';
+    guardExists($file);
+    ensureDir(PROJECT_ROOT . '/requests');
+    $tpl = <<<PHP
+<?php
+
+use EzMvc\Attr\ErrorMessage;
+use EzMvc\Attr\Required;
+use EzMvc\Request;
+
+// Each public property is a form field, validated like an API request class.
+// Give every field a default: the template reads it before the form is sent.
+// Redisplay a submitted value with \$form->esc('field'), never the raw property.
+// Echo EzMvc\Request::csrfField() inside every <form method="post"> in the template.
+class {$className} extends Request {
+
+    #[Required('Field is required')]
+    public string \$field = '';
+
+    // #[Validators\Email]
+    // #[ErrorMessage('Not a valid email address')]
+    // public string \$email = '';
+
+    // public ?int \$amount = null;
+
+    // Optional: cross-field checks after every field passed.
+    // protected function postCheck(): void {
+    //     \$this->addError('field', 'Message');
+    // }
+
+}
+PHP;
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+}
+
+function cmdMakeResponse(?string $name): void{
+    requireName($name, 'make:response');
+    $name      = slugToName($name);
+    $className = $name . 'Response';
+    $file      = PROJECT_ROOT . '/responses/' . $className . '.php';
+    guardExists($file);
+    ensureDir(PROJECT_ROOT . '/responses');
+    $tpl = <<<PHP
+<?php
+
+/**
+ * An API contract — the response shape this endpoint returns. Name it after the
+ * operation, not an entity.
+ *
+ * Write one when no single entity's Dto expresses the shape: a payload spanning
+ * several entities, an action-specific result, or a narrower view than the
+ * table (a Dto's field list can't be narrowed by deleting properties — the
+ * Entity's generated toDto() puts them back as dynamic properties). If a
+ * {Table}Dto already is the shape you want, use that instead — a Dto is a
+ * perfectly good contract.
+ *
+ * Typed properties are followed into the Swagger spec, so a property holding
+ * another Dto or Response is documented too (an @ property docblock is not).
+ */
+class {$className} {
+
+    public int \$id;
+
+}
+PHP;
+    writeFile($file, $tpl);
+    ok('Created ' . $file);
+}
+
+function cmdDeploy(array $flags): void{
+    // Reject unknown options rather than ignoring them: a mistyped --dry-run
+    // would otherwise silently run a real deploy against the live site.
+    $known = ['--dry-run', '--changed', '--full', '--no-maintenance', '--zip'];
+    foreach($flags as $flag){
+        if(!in_array($flag, $known)){
+            fail('Unknown deploy option: ' . $flag);
+            out('Valid options: ' . implode('  ', $known), 'yellow');
+            exit(1);
+        }
+    }
+
+    $dryRun    = in_array('--dry-run', $flags);
+    $changed   = in_array('--changed', $flags);
+    $full      = in_array('--full', $flags);
+    $zip       = in_array('--zip', $flags);
+    $startedAt = time();
+
+    $configFile = PROJECT_ROOT . '/deploy.json';
+    if(!file_exists($configFile)){
+        fail('deploy.json not found. Copy deploy.json.sample and fill in your values.');
+        exit(1);
+    }
+
+    $cfg = json_decode(file_get_contents($configFile), true);
+    if(!$cfg){
+        fail('deploy.json is not valid JSON.');
+        exit(1);
+    }
+
+    // Always regenerate routes/swagger/autoloader before collecting files to
+    // deploy, so what gets uploaded (or previewed under --dry-run) is never
+    // stale — covers both the FTP and local-folder deploy modes below.
+    out('Running generate before deploy...', 'cyan');
+    cmdGenerate();
+    out('');
+
+    // Local folder mode: "path" set, no "host"
+    if(isset($cfg['path']) && !isset($cfg['host'])){
+        if($zip){
+            fail('--zip is for FTP targets only — a local path is already a plain file copy.');
+            exit(1);
+        }
+        cmdDeployLocal($flags, $cfg);
+        return;
+    }
+
+    foreach(['host', 'user', 'pass', 'remote', 'base_url'] as $req){
+        if(empty($cfg[$req])){
+            fail('deploy.json is missing required field: ' . $req);
+            exit(1);
+        }
+    }
+
+    $host    = $cfg['host'];
+    $port    = (int)($cfg['port']   ?? 21);
+    $user    = $cfg['user'];
+    $pass    = $cfg['pass'];
+    $ssl     = (bool)($cfg['ssl']   ?? true);
+    $remote  = rtrim($cfg['remote'], '/') . '/';
+    $baseUrl = rtrim($cfg['base_url'], '/');
+
+    // The deploy token authorizes writing to the site, so it must never travel
+    // in the clear — and neither should the archive it unlocks.
+    if($zip && !str_starts_with(strtolower($baseUrl), 'https://')){
+        fail('--zip requires an https base_url — the deploy token would otherwise be sent in the clear.');
+        exit(1);
+    }
+    if($zip && !class_exists('ZipArchive')){
+        fail('--zip needs the zip extension in the PHP running this CLI.');
+        exit(1);
+    }
+    if($zip && in_array('--no-maintenance', $flags)){
+        fail('--zip and --no-maintenance conflict: the maintenance stub is what unpacks the archive.');
+        exit(1);
+    }
+
+    $alwaysExclude = [
+        'deploy.json', 'deploy.json.sample', '.ezmvc-deploy-state',
+        '.git/', '.gitignore', 'Config.local.php',
+        'logs/', '*.md',
+    ];
+    $exclude = array_unique(array_merge($alwaysExclude, $cfg['exclude'] ?? []));
+
+    // vendor/ is the one tree that can dwarf the project on an FTP-only host.
+    // See deployVendorSkippable() for why composer.lock decides this, not mtimes.
+    $vendorExcluded = deployIsExcluded('vendor/autoload.php', $exclude);
+    $vendorSkipped  = !$vendorExcluded && deployVendorSkippable($full);
+    if($vendorSkipped){
+        $exclude[] = 'vendor/';
+        out('composer.lock unchanged since the last deploy — skipping vendor/ (--full uploads it anyway).', 'yellow');
+    }
+
+    // Connect via FTPS or plain FTP
+    out('Connecting to ' . $host . ':' . $port . ' via ' . ($ssl ? 'FTPS' : 'FTP') . '...', 'cyan');
+
+    if($ssl){
+        if(!function_exists('ftp_ssl_connect')){
+            fail('ftp_ssl_connect() not available — PHP must be compiled with OpenSSL and the ftp extension enabled.');
+            exit(1);
+        }
+        $conn = @ftp_ssl_connect($host, $port, 30);
+    }else{
+        $conn = @ftp_connect($host, $port, 30);
+    }
+
+    if(!$conn){
+        fail('Could not connect to ' . $host . ':' . $port);
+        exit(1);
+    }
+
+    if(!@ftp_login($conn, $user, $pass)){
+        fail('FTP login failed for user ' . $user);
+        ftp_close($conn);
+        exit(1);
+    }
+
+    ftp_pasv($conn, true);
+    ok('Connected');
+
+    // Clean up any probe files left by a previous crashed deploy
+    deployCleanupProbes($conn, $remote);
+    deployCheckStaleMaintenance($conn, $remote);
+
+    // Ensure required server directories exist
+    @ftp_mkdir($conn, $remote . 'logs');
+
+    // Collect files
+    $since = ($changed && !$dryRun) ? deployLastState() : null;
+    $files = deployCollectFiles(PROJECT_ROOT, $exclude, $since);
+
+    if($dryRun){
+        out('');
+        out('Dry run — ' . count($files) . ' file(s) would be uploaded:', 'bold');
+        foreach($files as $rel){
+            out('  ' . $rel);
+        }
+        ftp_close($conn);
+        return;
+    }
+
+    // Take the app offline for the duration of the upload, so no visitor ever
+    // hits a half-updated mix of old and new files. The stub that stands in for
+    // index.php is also the deploy endpoint — see deployMaintenanceStub().
+    $token       = null;
+    $maintenance = deployUseMaintenance($flags, $exclude);
+    if($maintenance){
+        $token       = deployToken();
+        $maintenance = deployMaintenanceBegin($conn, $remote, $token);
+    }
+    if(!$maintenance){
+        $token = null;
+        if($zip){
+            fail('--zip needs the maintenance window (the stub is what unpacks the archive).');
+            ftp_close($conn);
+            exit(1);
+        }
+    }
+    if($maintenance){
+        // index.php goes up last, by deployMaintenanceEnd(), not in the loop or
+        // the archive — overwriting the stub mid-deploy would kill the endpoint
+        // doing the deploying.
+        $files = array_values(array_filter($files, function($rel){ return $rel !== 'index.php'; }));
+    }
+
+    // Probe the server through the stub. Has to happen after the stub is up:
+    // the catch-all in .htaccess rewrites every other path to index.php, so a
+    // standalone probe file never executes.
+    if($token !== null){
+        $probe = deployStubCall($baseUrl, $token, 'probe');
+        if($probe && isset($probe['php'])){
+            deployReportProbe($probe, function() use ($conn, $remote){
+                out('Restoring index.php before aborting...', 'yellow');
+                deployMaintenanceEnd($conn, $remote);
+                ftp_close($conn);
+            });
+            if($zip && empty($probe['zip'])){
+                out('Server has no zip extension — falling back to file-by-file upload.', 'yellow');
+                $zip = false;
+            }
+        }else{
+            out('Could not reach the deploy endpoint — skipping the PHP version check.', 'yellow');
+            if($zip){
+                fail('--zip cannot continue without the deploy endpoint.');
+                deployMaintenanceEnd($conn, $remote);
+                ftp_close($conn);
+                exit(1);
+            }
+        }
+    }
+
+    out('');
+    $uploaded = 0;
+    $failed   = 0;
+
+    if($zip){
+        [$uploaded, $failed] = deployUploadZip($conn, $remote, $baseUrl, $token, $files);
+    }else{
+        out('Uploading ' . count($files) . ' file(s)...', 'cyan');
+        $made = [];
+        foreach($files as $rel){
+            $local      = PROJECT_ROOT . '/' . $rel;
+            $remotePath = $remote . str_replace('\\', '/', $rel);
+            $remoteDir  = dirname($remotePath);
+
+            deployMkdirRecursive($conn, $remoteDir, $made);
+
+            if(@ftp_put($conn, $remotePath, $local, FTP_BINARY)){
+                out('  ↑ ' . $rel);
+                $uploaded++;
+            }else{
+                fail('  ✗ ' . $rel);
+                $failed++;
+            }
+        }
+    }
+
+    if($maintenance){
+        out('');
+        if(deployMaintenanceEnd($conn, $remote)){
+            $uploaded++;
+        }else{
+            $failed++;
+        }
+    }
+
+    // Only record the deploy when everything landed. Saving on a partial run
+    // would push the recorded timestamp past the failed files' mtimes, so the
+    // next --changed deploy would skip exactly the files that did not make it.
+    if($failed === 0){
+        deploySaveState($startedAt, $vendorExcluded ? deployLastLockHash() : deployLockHash());
+    }else{
+        out('Deploy state not updated because of the failures above — ' .
+            'the next --changed run will retry these files.', 'yellow');
+    }
+
+    ftp_close($conn);
+
+    out('');
+    ok($uploaded . ' file(s) uploaded' . ($failed > 0 ? ', ' . $failed . ' failed' : ''));
+
+    // Non-zero so a script or CI step can tell a partial deploy from a clean one.
+    if($failed > 0) exit(1);
+}
+
+function cmdDeployLocal(array $flags, array $cfg): void{
+    $dryRun    = in_array('--dry-run', $flags);
+    $changed   = in_array('--changed', $flags);
+    $full      = in_array('--full', $flags);
+    $startedAt = time();
+
+    $path    = rtrim(str_replace('\\', '/', $cfg['path']), '/') . '/';
+    $baseUrl = !empty($cfg['base_url']) ? rtrim($cfg['base_url'], '/') : null;
+
+    $alwaysExclude = [
+        'deploy.json', 'deploy.json.sample', '.ezmvc-deploy-state',
+        '.git/', '.gitignore', 'Config.local.php',
+        'logs/', '*.md',
+    ];
+    $exclude = array_unique(array_merge($alwaysExclude, $cfg['exclude'] ?? []));
+
+    $vendorExcluded = deployIsExcluded('vendor/autoload.php', $exclude);
+    $vendorSkipped  = !$vendorExcluded && deployVendorSkippable($full);
+    if($vendorSkipped){
+        $exclude[] = 'vendor/';
+        out('composer.lock unchanged since the last deploy — skipping vendor/ (--full copies it anyway).', 'yellow');
+    }
+
+    out('Deploying to local path: ' . $path, 'cyan');
+
+    if(!is_dir($path)){
+        fail('Target path does not exist: ' . $path);
+        exit(1);
+    }
+
+    // Ensure required directories exist
+    if(!is_dir($path . 'logs')){
+        mkdir($path . 'logs', 0755, true);
+    }
+
+    // Clean up leftover probe files
+    foreach((array)glob($path . '_ezmvc_check_????????????????.php') as $f){
+        @unlink($f);
+        out('Cleaned up leftover probe: ' . basename($f), 'yellow');
+    }
+
+    if(file_exists($path . DEPLOY_MAINTENANCE_FLAG)){
+        out('A previous deploy left this target in maintenance mode — ' .
+            'this run will restore index.php at the end.', 'yellow');
+    }
+
+    // PHP probe via HTTP (only when base_url is configured)
+    $since = ($changed && !$dryRun) ? deployLastState() : null;
+    $files = deployCollectFiles(PROJECT_ROOT, $exclude, $since);
+
+    if($dryRun){
+        out('');
+        out('Dry run — ' . count($files) . ' file(s) would be copied:', 'bold');
+        foreach($files as $rel){
+            out('  ' . $rel);
+        }
+        return;
+    }
+
+    $token       = null;
+    $maintenance = deployUseMaintenance($flags, $exclude);
+    if($maintenance){
+        $token       = deployToken();
+        $maintenance = deployLocalMaintenanceBegin($path, $token);
+    }
+    if(!$maintenance) $token = null;
+    if($maintenance){
+        $files = array_values(array_filter($files, function($rel){ return $rel !== 'index.php'; }));
+    }
+
+    // Probed through the stub, for the same reason as the FTP path: the
+    // catch-all rewrite means a standalone probe file never executes.
+    if($token !== null && $baseUrl){
+        $probe = deployStubCall($baseUrl, $token, 'probe');
+        if($probe && isset($probe['php'])){
+            deployReportProbe($probe, function() use ($path){ deployLocalMaintenanceEnd($path); });
+        }else{
+            out('Could not reach the deploy endpoint — skipping the PHP version check.', 'yellow');
+        }
+    }
+
+    out('');
+    out('Copying ' . count($files) . ' file(s)...', 'cyan');
+    $copied = 0;
+    $failed = 0;
+
+    foreach($files as $rel){
+        $src = PROJECT_ROOT . '/' . $rel;
+        $dst = $path . $rel;
+        $dir = dirname($dst);
+
+        if(!is_dir($dir)){
+            mkdir($dir, 0755, true);
+        }
+
+        // Suppressed like ftp_put() on the FTP path — the fail() line below is
+        // the readable report; a raw PHP warning on top of it is just noise.
+        if(@copy($src, $dst)){
+            out('  ↑ ' . $rel);
+            $copied++;
+        }else{
+            fail('  ✗ ' . $rel);
+            $failed++;
+        }
+    }
+
+    if($maintenance){
+        out('');
+        if(deployLocalMaintenanceEnd($path)){
+            $copied++;
+        }else{
+            $failed++;
+        }
+    }
+
+    // See the FTP path for why a partial run must not save state.
+    if($failed === 0){
+        deploySaveState($startedAt, $vendorExcluded ? deployLastLockHash() : deployLockHash());
+    }else{
+        out('Deploy state not updated because of the failures above — ' .
+            'the next --changed run will retry these files.', 'yellow');
+    }
+
+    out('');
+    ok($copied . ' file(s) copied' . ($failed > 0 ? ', ' . $failed . ' failed' : ''));
+
+    if($failed > 0) exit(1);
+}
+
+function deployReportProbe(array $probe, ?callable $onAbort): void{
+    $serverPhp = $probe['php'];
+    $localPhp  = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '.' . PHP_RELEASE_VERSION;
+    out('Server PHP: ' . $serverPhp . '  (local: ' . $localPhp . ')', 'none');
+
+    $serverMajMin = implode('.', array_slice(explode('.', $serverPhp), 0, 2));
+    $localMajMin  = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+
+    if($serverMajMin !== $localMajMin){
+        if(version_compare($serverPhp, $localPhp, '<')){
+            if($onAbort) $onAbort();
+            fail('Server PHP ' . $serverPhp . ' is older than local PHP ' . $localPhp . ' — deploy aborted.');
+            exit(1);
+        }
+        out('Warning: server PHP ' . $serverPhp . ' differs from local PHP ' . $localPhp, 'yellow');
+    }
+
+    foreach(['mysqli', 'mysqlnd', 'openssl'] as $ext){
+        if(array_key_exists($ext, $probe) && !$probe[$ext]){
+            out('Warning: ' . $ext . ' extension not loaded on server', 'yellow');
+        }
+    }
+}
+
+/**
+ * Sweep leftovers from a crashed deploy: probe files written by older versions
+ * of this CLI, and payload archives whose extract call never completed. A
+ * payload holds the entire app, so it must never be left lying on the server.
+ */
+function deployCleanupProbes($conn, string $remote): void{
+    $list = @ftp_nlist($conn, $remote);
+    if(!$list) return;
+    foreach($list as $entry){
+        $base = basename($entry);
+        if(preg_match('/^_ezmvc_check_[0-9a-f]{16}\.php$/', $base)){
+            @ftp_delete($conn, $remote . $base);
+            out('Cleaned up leftover probe: ' . $base, 'yellow');
+        }
+        if(preg_match('/^_ezmvc_payload_[0-9a-f]{32}\.zip$/', $base)){
+            @ftp_delete($conn, $remote . $base);
+            out('Cleaned up leftover deploy archive: ' . $base, 'yellow');
+        }
+    }
+}
+
+function deployCollectFiles(string $root, array $exclude, ?int $since): array{
+    $files = [];
+    $it    = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+
+    foreach($it as $file){
+        if($file->isDir()) continue;
+        $rel = str_replace('\\', '/', substr($file->getPathname(), strlen($root) + 1));
+        if(deployIsExcluded($rel, $exclude)) continue;
+        // Strictly less-than, against the time the last deploy STARTED: a file
+        // written during (or in the same second as) that deploy is re-sent
+        // rather than assumed delivered. mtime has 1s granularity, so an
+        // inclusive test here silently drops such a file forever.
+        if($since !== null && $file->getMTime() < $since) continue;
+        $files[] = $rel;
+    }
+
+    sort($files);
+    return $files;
+}
+
+function deployIsExcluded(string $rel, array $exclude): bool{
+    // .htaccess files are always deployed regardless of directory exclusions
+    if(basename($rel) === '.htaccess') return false;
+
+    foreach($exclude as $pattern){
+        if(str_ends_with($pattern, '/')){
+            if(str_starts_with($rel, ltrim($pattern, '/'))){
+                return true;
+            }
+        }elseif(str_contains($pattern, '*')){
+            if(fnmatch($pattern, basename($rel))){
+                return true;
+            }
+        }elseif($rel === $pattern || $rel === ltrim($pattern, '/') || basename($rel) === $pattern){
+            return true;
+        }
+    }
+    return false;
+}
+
+function deployMkdirRecursive($conn, string $dir, array &$made): void{
+    $parts = explode('/', ltrim(str_replace('\\', '/', $dir), '/'));
+    $path  = '';
+    foreach($parts as $part){
+        if($part === '') continue;
+        $path .= '/' . $part;
+        if(!isset($made[$path])){
+            @ftp_mkdir($conn, $path);
+            $made[$path] = true;
+        }
+    }
+}
+
+function deployLastState(): ?int{
+    $f = PROJECT_ROOT . '/.ezmvc-deploy-state';
+    if(!file_exists($f)) return null;
+    $d = json_decode(file_get_contents($f), true);
+    return $d['deployed_at'] ?? null;
+}
+
+/**
+ * Record a completed deploy. Call this only when nothing failed — the stored
+ * timestamp is what --changed compares mtimes against, so writing it after a
+ * partial run permanently hides the files that did not make it.
+ *
+ * $startedAt is when this run BEGAN, not when it ended: anything edited while
+ * the upload was in flight must still look newer than the recorded deploy.
+ *
+ * $lockHash is the composer.lock hash to remember for the vendor/ skip. Pass
+ * the CURRENT hash when vendor/ was part of this deploy, or the previously
+ * stored one when the project excludes vendor/ from deploys entirely.
+ */
+function deploySaveState(int $startedAt, ?string $lockHash): void{
+    file_put_contents(
+        PROJECT_ROOT . '/.ezmvc-deploy-state',
+        json_encode(['deployed_at' => $startedAt, 'composer_lock' => $lockHash])
+    );
+}
+
+function deployLockHash(): ?string{
+    $f = PROJECT_ROOT . '/composer.lock';
+    return file_exists($f) ? sha1_file($f) : null;
+}
+
+function deployLastLockHash(): ?string{
+    $f = PROJECT_ROOT . '/.ezmvc-deploy-state';
+    if(!file_exists($f)) return null;
+    $d = json_decode(file_get_contents($f), true);
+    return $d['composer_lock'] ?? null;
+}
+
+/**
+ * Whether vendor/ can be left out of this deploy.
+ *
+ * On an FTP-only host vendor/ is usually the bulk of the upload — one round
+ * trip per file, and a dependency tree runs to thousands of them. Its contents
+ * are decided entirely by composer.lock, so that file's hash is the honest
+ * "has anything changed" signal. Per-file mtimes are not: every composer
+ * install/update rewrites the whole tree, which would re-upload thousands of
+ * byte-identical files under --changed.
+ *
+ * Conservative by design — an unknown hash (no lock file, or a state file from
+ * before this was recorded) means "upload it".
+ */
+function deployVendorSkippable(bool $full): bool{
+    if($full) return false;
+    if(!is_dir(PROJECT_ROOT . '/vendor')) return false;
+    $hash = deployLockHash();
+    return $hash !== null && $hash === deployLastLockHash();
+}
+
+/**
+ * Files go up one at a time over FTP, so for the length of the upload the
+ * server holds a mix of old and new code. Replacing index.php with a 503 stub
+ * first and restoring the real one last closes that window: every non-public
+ * path routes through index.php, so that single file gates the whole app.
+ *
+ * Skipped when the project excludes index.php from deploys (nothing would ever
+ * restore it) or when --no-maintenance is passed.
+ */
+function deployUseMaintenance(array $flags, array $exclude): bool{
+    if(in_array('--no-maintenance', $flags)) return false;
+    if(!file_exists(PROJECT_ROOT . '/index.php')) return false;
+    if(deployIsExcluded('index.php', $exclude)){
+        out('index.php is excluded from this deploy — skipping the maintenance window.', 'yellow');
+        return false;
+    }
+    return true;
+}
+
+/** A deploy token: 32 hex chars from the CSPRNG. Only its hash ever reaches the server. */
+function deployToken(): string{
+    return bin2hex(random_bytes(16));
+}
+
+/**
+ * The stand-in for index.php while the upload runs — and, for an authorized
+ * caller, the endpoint that does the deploying.
+ *
+ * Why index.php itself rather than a separate script: .htaccess rewrites every
+ * non-public path to index.php, so a standalone endpoint uploaded next to it
+ * would never execute. The stub is already guaranteed reachable, already
+ * temporary, and already replaced by the real index.php at the end of the run —
+ * so the deploy endpoint inherits a lifetime that is bounded by construction
+ * instead of needing one bolted on.
+ *
+ * Anything that is not an authorized command gets the 503 maintenance page and
+ * nothing else: no 401, no 403, no hint that an endpoint is here at all. Three
+ * independent things must hold for a command to run — a token whose SHA-256
+ * matches (compared with hash_equals, so timing tells an attacker nothing), a
+ * request that arrives before the baked-in expiry, and a known action. After
+ * the expiry the file is inert: a plain 503 page that cannot be commanded, so
+ * even a deploy that dies mid-run degrades to a harmless maintenance page
+ * rather than leaving a live write endpoint on the site.
+ *
+ * $tokenHash empty (local copies, where nothing needs to be commanded remotely)
+ * produces the plain maintenance page with no command handling compiled in.
+ */
+function deployMaintenanceStub(string $tokenHash = '', int $expiresAt = 0): string{
+    $tpl = <<<'PHP'
+<?php
+$H = '__TOKEN_HASH__';
+$X = __EXPIRES__;
+
+header_remove('X-Powered-By');
+
+$sent   = isset($_SERVER['HTTP_X_DEPLOY_TOKEN']) ? $_SERVER['HTTP_X_DEPLOY_TOKEN'] : '';
+$action = isset($_POST['action']) ? $_POST['action'] : '';
+
+if($H !== '' && $sent !== '' && $action !== '' && time() < $X
+    && hash_equals($H, hash('sha256', $sent))){
+
+    header('Content-Type: application/json');
+    header('Cache-Control: no-store');
+
+    if($action === 'probe'){
+        echo json_encode([
+            'php'     => PHP_VERSION,
+            'mysqli'  => extension_loaded('mysqli'),
+            'mysqlnd' => extension_loaded('mysqlnd'),
+            'openssl' => extension_loaded('openssl'),
+            'zip'     => class_exists('ZipArchive'),
+        ]);
+        exit;
+    }
+
+    if($action === 'extract'){
+        $file = isset($_POST['file']) ? $_POST['file'] : '';
+        if(!preg_match('/^_ezmvc_payload_[0-9a-f]{32}\.zip$/', $file)){
+            http_response_code(400);
+            echo json_encode(['error' => 'bad payload name']);
+            exit;
+        }
+        $path = __DIR__ . '/' . $file;
+        if(!is_file($path)){
+            http_response_code(404);
+            echo json_encode(['error' => 'payload missing']);
+            exit;
+        }
+        if(!class_exists('ZipArchive')){
+            http_response_code(501);
+            echo json_encode(['error' => 'no zip extension']);
+            exit;
+        }
+
+        $zip = new ZipArchive();
+        if($zip->open($path) !== true){
+            http_response_code(500);
+            echo json_encode(['error' => 'cannot open payload']);
+            exit;
+        }
+
+        // Validate every entry BEFORE writing anything: a path escaping the
+        // docroot, or an index.php that would overwrite this running stub and
+        // kill the deploy halfway, aborts the whole archive.
+        $names = [];
+        for($i = 0; $i < $zip->numFiles; $i++){
+            $name = $zip->getNameIndex($i);
+            if($name === false || $name === ''
+                || $name[0] === '/' || $name[0] === '\\'
+                || strpos($name, '..') !== false
+                || strpos($name, '\\') !== false
+                || preg_match('#^[A-Za-z]:#', $name)
+                || $name === 'index.php'){
+                $zip->close();
+                http_response_code(400);
+                echo json_encode(['error' => 'unsafe entry', 'entry' => (string)$name]);
+                exit;
+            }
+            $names[] = $name;
+        }
+
+        $okExtract = $zip->extractTo(__DIR__);
+        $zip->close();
+        @unlink($path);
+
+        if(!$okExtract){
+            http_response_code(500);
+            echo json_encode(['error' => 'extract failed']);
+            exit;
+        }
+        echo json_encode(['extracted' => count($names)]);
+        exit;
+    }
+
+    http_response_code(400);
+    echo json_encode(['error' => 'unknown action']);
+    exit;
+}
+
+http_response_code(503);
+header('Retry-After: 120');
+header('Cache-Control: no-store');
+?>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="robots" content="noindex">
+<title>Temporarily unavailable</title>
+<style>body{font-family:system-ui,sans-serif;margin:15% auto;max-width:32em;padding:0 1em;text-align:center}</style>
+</head><body>
+<h1>Temporarily unavailable</h1>
+<p>This site is being updated. Please try again in a few minutes.</p>
+</body></html>
+PHP;
+
+    return str_replace(
+        ['__TOKEN_HASH__', '__EXPIRES__'],
+        [$tokenHash, (string)$expiresAt],
+        $tpl
+    );
+}
+
+function deployCheckStaleMaintenance($conn, string $remote): void{
+    $list = @ftp_nlist($conn, $remote);
+    if(!$list) return;
+    foreach($list as $entry){
+        if(basename($entry) === DEPLOY_MAINTENANCE_FLAG){
+            out('A previous deploy left this site in maintenance mode — ' .
+                'this run will restore index.php at the end.', 'yellow');
+            return;
+        }
+    }
+}
+
+function deployMaintenanceBegin($conn, string $remote, ?string $token = null): bool{
+    $flag = tempnam(sys_get_temp_dir(), 'ezmvc_flag_');
+    file_put_contents($flag, "deploy in progress\n");
+    @ftp_put($conn, $remote . DEPLOY_MAINTENANCE_FLAG, $flag, FTP_ASCII);
+    unlink($flag);
+
+    $tmp = tempnam(sys_get_temp_dir(), 'ezmvc_maint_');
+    file_put_contents($tmp, $token === null
+        ? deployMaintenanceStub()
+        : deployMaintenanceStub(hash('sha256', $token), time() + DEPLOY_TOKEN_TTL));
+    $ok = @ftp_put($conn, $remote . 'index.php', $tmp, FTP_BINARY);
+    unlink($tmp);
+
+    if(!$ok){
+        @ftp_delete($conn, $remote . DEPLOY_MAINTENANCE_FLAG);
+        out('Could not upload the maintenance stub — continuing without a maintenance window.', 'yellow');
+        return false;
+    }
+
+    ok('Maintenance mode on — index.php replaced with a 503 stub');
+    return true;
+}
+
+function deployMaintenanceEnd($conn, string $remote): bool{
+    if(@ftp_put($conn, $remote . 'index.php', PROJECT_ROOT . '/index.php', FTP_BINARY)){
+        @ftp_delete($conn, $remote . DEPLOY_MAINTENANCE_FLAG);
+        ok('Maintenance mode off — index.php restored, site is live');
+        return true;
+    }
+    fail('COULD NOT RESTORE index.php — the site is still serving the 503 stub.');
+    out('Re-run  ezmvc deploy  to finish, or upload index.php by hand.', 'yellow');
+    return false;
+}
+
+/**
+ * POST a command to the deploy endpoint living in the maintenance stub.
+ * The token goes in a header, never the URL — query strings end up in access
+ * logs, which on shared hosting are not reliably private.
+ */
+function deployStubCall(string $baseUrl, string $token, string $action, array $extra = []): ?array{
+    if(!function_exists('curl_init')) return null;
+
+    $ch = curl_init($baseUrl . '/');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 120,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query(array_merge(['action' => $action], $extra)),
+        CURLOPT_HTTPHEADER     => ['X-Deploy-Token: ' . $token],
+    ]);
+    $body = curl_exec($ch);
+    curl_close($ch);
+
+    if(!$body) return null;
+    $data = json_decode($body, true);
+    return is_array($data) ? $data : null;
+}
+
+/**
+ * Pack the whole file list into one archive, upload that, and have the stub
+ * unpack it — one FTP round trip instead of thousands. index.php is not in the
+ * list (the stub restores the real one at the end), so the endpoint doing the
+ * unpacking can never be overwritten by its own payload.
+ *
+ * Returns [uploaded, failed] so the caller's accounting is the same either way.
+ */
+function deployUploadZip($conn, string $remote, string $baseUrl, string $token, array $files): array{
+    if(!$files){
+        out('Nothing to upload.', 'cyan');
+        return [0, 0];
+    }
+
+    $name  = '_ezmvc_payload_' . bin2hex(random_bytes(16)) . '.zip';
+    $local = sys_get_temp_dir() . '/' . $name;
+
+    out('Packing ' . count($files) . ' file(s)...', 'cyan');
+    $zip = new ZipArchive();
+    if($zip->open($local, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true){
+        fail('Could not create the archive locally.');
+        return [0, count($files)];
+    }
+    foreach($files as $rel){
+        if(!$zip->addFile(PROJECT_ROOT . '/' . $rel, $rel)){
+            $zip->close();
+            @unlink($local);
+            fail('Could not add ' . $rel . ' to the archive.');
+            return [0, count($files)];
+        }
+    }
+    $zip->close();
+
+    $size = filesize($local);
+    out('Uploading archive (' . deployHumanSize($size) . ')...', 'cyan');
+
+    if(!@ftp_put($conn, $remote . $name, $local, FTP_BINARY)){
+        @unlink($local);
+        fail('Archive upload failed.');
+        return [0, count($files)];
+    }
+    @unlink($local);
+
+    out('Unpacking on the server...', 'cyan');
+    $res = deployStubCall($baseUrl, $token, 'extract', ['file' => $name]);
+
+    if(!$res || !isset($res['extracted'])){
+        // Never leave the payload behind: it holds the whole app.
+        @ftp_delete($conn, $remote . $name);
+        fail('Unpack failed' . (isset($res['error']) ? ': ' . $res['error'] : '.'));
+        return [0, count($files)];
+    }
+
+    // The stub deletes the payload after a successful extract; make sure.
+    @ftp_delete($conn, $remote . $name);
+
+    ok($res['extracted'] . ' file(s) unpacked from the archive');
+    return [(int)$res['extracted'], 0];
+}
+
+function deployHumanSize(int $bytes): string{
+    if($bytes >= 1048576) return round($bytes / 1048576, 1) . ' MB';
+    if($bytes >= 1024)    return round($bytes / 1024) . ' KB';
+    return $bytes . ' B';
+}
+
+function deployLocalMaintenanceBegin(string $path, ?string $token = null): bool{
+    file_put_contents($path . DEPLOY_MAINTENANCE_FLAG, "deploy in progress\n");
+
+    $stub = $token === null
+        ? deployMaintenanceStub()
+        : deployMaintenanceStub(hash('sha256', $token), time() + DEPLOY_TOKEN_TTL);
+
+    if(file_put_contents($path . 'index.php', $stub) === false){
+        @unlink($path . DEPLOY_MAINTENANCE_FLAG);
+        out('Could not write the maintenance stub — continuing without a maintenance window.', 'yellow');
+        return false;
+    }
+
+    ok('Maintenance mode on — index.php replaced with a 503 stub');
+    return true;
+}
+
+function deployLocalMaintenanceEnd(string $path): bool{
+    if(copy(PROJECT_ROOT . '/index.php', $path . 'index.php')){
+        @unlink($path . DEPLOY_MAINTENANCE_FLAG);
+        ok('Maintenance mode off — index.php restored, site is live');
+        return true;
+    }
+    fail('COULD NOT RESTORE index.php — the target is still serving the 503 stub.');
+    out('Re-run  ezmvc deploy  to finish, or copy index.php by hand.', 'yellow');
+    return false;
+}
+
+function cmdSetup(): void{
+    out('Setting up project in: ' . PROJECT_ROOT, 'cyan');
+
+    // Project marker so future commands can detect the root by walking up
+    $marker = PROJECT_ROOT . '/.ezmvc';
+    if(!file_exists($marker)){
+        writeFile($marker, '');
+        ok('Created .ezmvc project marker');
+    }
+
+    $dirs = ['controllers', 'entities', 'dtos', 'databases', 'services', 'exceptions', 'views', 'templates', 'requests', 'responses', 'public', 'logs', 'private'];
+    foreach($dirs as $dir){
+        ensureDir(PROJECT_ROOT . '/' . $dir);
+    }
+
+    ensureDir(PROJECT_ROOT . '/generated');
+
+    // Secret DATA dirs get their OWN standalone deny (Apache 2.4, mod_authz —
+    // works even if the root .htaccess is broken/misedited, and survives it).
+    // Code dirs deliberately get NONE: the root .htaccess routes them to a
+    // uniform 404 (a per-dir 403 would fingerprint the stack), and generated/
+    // is code output the same catch-all covers. See the root .htaccess.
+    foreach(['logs', 'private'] as $secretDir){
+        $ht = PROJECT_ROOT . '/' . $secretDir . '/.htaccess';
+        if(!file_exists($ht)){
+            writeFile($ht, "Require all denied\n");
+            ok('Created ' . $secretDir . '/.htaccess');
+        }
+    }
+
+    $config = PROJECT_ROOT . '/Config.php';
+    if(!file_exists($config)){
+        $tpl = <<<'PHP'
+<?php
+
+class Config {
+    const PRODUCT        = 'My Project';
+    const DESCRIPTION    = '';
+    const VERSION        = '1.0.0';
+    // false disables the API docs. Re-run `ezmvc generate` after changing this —
+    // it empties the publicly-served generated/swagger.json (the UI hides at once).
+    const ENABLE_SWAGGER = true;
+    // The start page shown at the site root until a default page controller
+    // is configured. It lists the PHP version — set false in production.
+    const ENABLE_WELCOME_PAGE = true;
+
+    const DB_HOST = 'localhost';
+    const DB_NAME = 'database';
+    const DB_USER = 'user';
+    const DB_PASS = '';
+
+    const BASE_PATH = 'http://localhost/';
+
+    const LOGFILE_PREFIX = __DIR__ . '/logs/log';
+
+    const API_KEY = '';
+
+    // Session cookie name — keep it generic so the cookie doesn't fingerprint
+    // the stack to clients (e.g. 'sid', not 'ezmvc' or the telltale 'PHPSESSID').
+    const SESSION_NAME = 'sid';
+
+    const ERROR_REPORT_EMAIL = null;
+}
+PHP;
+        writeFile($config, $tpl);
+        ok('Created Config.php — fill in your credentials.');
+    }else{
+        out('Config.php already exists, skipping.', 'yellow');
+    }
+
+    $composerJson = PROJECT_ROOT . '/composer.json';
+    if(!file_exists($composerJson)){
+        $tpl = <<<'JSON'
+{
+    "name": "you/my-project",
+    "require": {
+        "php": ">=8.0"
+    },
+    "autoload": {
+        "classmap": [
+            "core/",
+            "entities/",
+            "dtos/",
+            "databases/",
+            "requests/",
+            "responses/",
+            "services/",
+            "exceptions/",
+            "views/",
+            "controllers/"
+        ]
+    }
+}
+JSON;
+        writeFile($composerJson, $tpl);
+        ok('Created composer.json with a classmap autoloader for core/entities/dtos/databases/requests/responses/services/exceptions/views/controllers.');
+    }else{
+        out('composer.json already exists — add an autoload.classmap section yourself if you want entities/dtos/etc. autoloaded (see ezmvc/cli README).', 'yellow');
+    }
+
+    ok('Setup complete. Next steps:');
+    out('  1. Edit Config.php', 'none');
+    out('  2. Run  composer install  to generate the autoloader', 'none');
+    out('  3. Create controllers with  ezmvc new controller <Name>', 'none');
+    out('  4. Run  ezmvc generate  to build routes and swagger spec (also refreshes the autoloader)', 'none');
+}
+
+function cmdHelp(): void{
+    out('');
+    out('ezmvc CLI', 'bold');
+    out('');
+    out('Usage:  ezmvc <command> [name]', 'none');
+    out('');
+    out('Commands:', 'bold');
+    out('  generate                         Build routes, swagger spec and generated/app.css');
+    out('  scaffold [options]               Generate Entity/Dto + the per-database class from existing DB tables');
+    out('    --table=<name>[,<name>...]       Scaffold specific table(s) (default: all tables)');
+    out('    --overwrite                      Replace existing files');
+    out('    --host= --db= --user= --pass=    Explicit connection, for projects with more than one DB');
+    out('                                     (default: use this project\'s own Config.php connection)');
+    out('  verify <EntityName>              Smoke-test a scaffolded Entity+Dto against the real DB');
+    out('                                     (store/getById/find/update/toDto/deleteLogical, then cleans up)');
+    out('  swagger:mirror [--version=X]     Fetch the Swagger UI assets into swagger/ (self-host the docs)');
+    out('                                     (default version: swagger/swagger-ui.version; gitignored)');
+    out('  deploy [options]                 Deploy via FTPS (or to a local path) using deploy.json');
+    out('    --dry-run                        Preview the file list without uploading');
+    out('    --changed                        Only files modified since the last successful deploy');
+    out('    --full                           Upload vendor/ even when composer.lock is unchanged');
+    out('    --no-maintenance                 Do not swap index.php for a 503 stub during the upload');
+    out('    --zip                            Upload one archive and unpack it server-side (https only)');
+    out('  new controller       <Name>      New ApiController with CRUD route stubs');
+    out('  new page-controller  <Name>      New page Controller');
+    out('  new view <type> <Name>           New View + template + stylesheet — type: single|multi|leaf|page');
+    out('  new service          <Name>      New plain Service class (no base class)');
+    out('  new request          <Name>      New API request contract (Validators\\* field validation)');
+    out('  new form-request     <Name>      New form/multipart Request class (page Controllers)');
+    out('  new response         <Name>      New Response class');
+    out('  setup                            Create project directories and Config.php template');
+    out('  help                             Show this help');
+    out('');
+    out('Install globally:', 'bold');
+    out('  composer global require ezmvc/cli');
+    out('');
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Walk up from CWD to find the nearest ezmvc project root.
+ * Markers (in preference order):
+ *   1. .ezmvc                              written by `ezmvc setup`
+ *   2. core/Core.php                       direct clone of ezmvc/ezmvc
+ *   3. vendor/ezmvc/ezmvc/core/Core.php    Composer dependency installed
+ */
+function findProjectRoot(): ?string{
+    $dir = getcwd();
+    while(true){
+        if(
+            file_exists($dir . '/.ezmvc') ||
+            file_exists($dir . '/core/Core.php') ||
+            file_exists($dir . '/vendor/ezmvc/ezmvc/core/Core.php')
+        ){
+            return $dir;
+        }
+        $parent = dirname($dir);
+        if($parent === $dir) break;
+        $dir = $parent;
+    }
+    return null;
+}
+
+function resolveFrameworkRoot(?string $projectRoot): ?string{
+    if($projectRoot === null) return null;
+    if(file_exists($projectRoot . '/core/Core.php'))
+        return $projectRoot;
+    if(file_exists($projectRoot . '/vendor/ezmvc/ezmvc/core/Core.php'))
+        return $projectRoot . '/vendor/ezmvc/ezmvc';
+    return null;
+}
+
+function requireFramework(): void{
+    $route  = FRAMEWORK_ROOT . '/core/attributes/Route.php';
+    $router = FRAMEWORK_ROOT . '/core/Router.php';
+    if(!file_exists($route) || !file_exists($router)){
+        fail('ezmvc framework core files not found.');
+        out('Expected at: ' . FRAMEWORK_ROOT . '/core/', 'none');
+        out('Make sure you are running ezmvc from your project root.', 'none');
+        exit(1);
+    }
+    require_once $route;
+    require_once $router;
+}
+
+function requireName(?string $name, string $cmd): void{
+    if(!$name){
+        fail('Usage: ezmvc ' . $cmd . ' <Name>');
+        exit(1);
+    }
+}
+
+function guardExists(string $file): void{
+    if(file_exists($file)){
+        fail($file . ' already exists. Delete it first or use a different name.');
+        exit(1);
+    }
+}
+
+function ensureDir(string $dir): void{
+    if(!is_dir($dir)){
+        mkdir($dir, 0755, true);
+        out('  Created directory: ' . $dir, 'none');
+    }
+}
+
+function writeFile(string $path, string $content): void{
+    file_put_contents($path, $content);
+}
+
+function nameToSlug(string $name): string{
+    return strtolower(preg_replace('/([A-Z])/', '-$1', lcfirst($name)));
+}
+
+function slugToName(string $slug): string{
+    return str_replace(' ', '', ucwords(str_replace('-', ' ', $slug)));
+}
+
+function pad(string $s, int $width): string{
+    return str_pad($s, $width);
+}
+
+function out(string $text, string $color = 'none'): void{
+    if(!CLI_COLOR || $color === 'none'){
+        echo $text . PHP_EOL;
+        return;
+    }
+    $codes = ['green' => '32', 'red' => '31', 'yellow' => '33', 'cyan' => '36', 'bold' => '1'];
+    $code  = $codes[$color] ?? '0';
+    echo "\033[{$code}m{$text}\033[0m" . PHP_EOL;
+}
+
+function ok(string $text): void{
+    out('✓ ' . $text, 'green');
+}
+
+function fail(string $text): void{
+    out('✗ ' . $text, 'red');
+}

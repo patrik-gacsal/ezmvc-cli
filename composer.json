@@ -1,0 +1,10 @@
+{
+    "name": "ezmvc/cli",
+    "description": "CLI tool for the ezmvc framework — scaffolding, route building, and project setup",
+    "keywords": ["ezmvc", "cli", "php", "framework", "scaffold"],
+    "license": "MIT",
+    "require": {
+        "php": ">=8.0"
+    },
+    "bin": ["bin/ezmvc", "bin/ezmvc.bat"]
+}
